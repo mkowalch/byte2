@@ -16,10 +16,11 @@
 
 The classes implement a command pattern, with every
 object supporting an execute() method that does the
-actuall HTTP request.
+actual HTTP request.
 """
 from __future__ import absolute_import
 import six
+from six.moves import http_client
 from six.moves import range
 
 __author__ = 'jcgregorio@google.com (Joe Gregorio)'
@@ -36,17 +37,27 @@ import logging
 import mimetypes
 import os
 import random
-import ssl
+import socket
 import sys
 import time
 import uuid
+
+# TODO(issue 221): Remove this conditional import jibbajabba.
+try:
+  import ssl
+except ImportError:
+  _ssl_SSLError = object()
+else:
+  _ssl_SSLError = ssl.SSLError
 
 from email.generator import Generator
 from email.mime.multipart import MIMEMultipart
 from email.mime.nonmultipart import MIMENonMultipart
 from email.parser import FeedParser
 
-from googleapiclient import mimeparse
+from googleapiclient import _helpers as util
+
+from googleapiclient import _auth
 from googleapiclient.errors import BatchError
 from googleapiclient.errors import HttpError
 from googleapiclient.errors import InvalidChunkSizeError
@@ -54,12 +65,65 @@ from googleapiclient.errors import ResumableUploadError
 from googleapiclient.errors import UnexpectedBodyError
 from googleapiclient.errors import UnexpectedMethodError
 from googleapiclient.model import JsonModel
-from oauth2client import util
 
 
-DEFAULT_CHUNK_SIZE = 512*1024
+LOGGER = logging.getLogger(__name__)
+
+DEFAULT_CHUNK_SIZE = 100*1024*1024
 
 MAX_URI_LENGTH = 2048
+
+_TOO_MANY_REQUESTS = 429
+
+DEFAULT_HTTP_TIMEOUT_SEC = 60
+
+_LEGACY_BATCH_URI = 'https://www.googleapis.com/batch'
+
+
+def _should_retry_response(resp_status, content):
+  """Determines whether a response should be retried.
+
+  Args:
+    resp_status: The response status received.
+    content: The response content body.
+
+  Returns:
+    True if the response should be retried, otherwise False.
+  """
+  # Retry on 5xx errors.
+  if resp_status >= 500:
+    return True
+
+  # Retry on 429 errors.
+  if resp_status == _TOO_MANY_REQUESTS:
+    return True
+
+  # For 403 errors, we have to check for the `reason` in the response to
+  # determine if we should retry.
+  if resp_status == six.moves.http_client.FORBIDDEN:
+    # If there's no details about the 403 type, don't retry.
+    if not content:
+      return False
+
+    # Content is in JSON format.
+    try:
+      data = json.loads(content.decode('utf-8'))
+      if isinstance(data, dict):
+        reason = data['error']['errors'][0]['reason']
+      else:
+        reason = data[0]['error']['errors']['reason']
+    except (UnicodeDecodeError, ValueError, KeyError):
+      LOGGER.warning('Invalid JSON content from response: %s', content)
+      return False
+
+    LOGGER.warning('Encountered 403 Forbidden with reason "%s"', reason)
+
+    # Only retry on rate limit related failures.
+    if reason in ('userRateLimitExceeded', 'rateLimitExceeded', ):
+      return True
+
+  # Everything else is a success or non-retriable so break.
+  return False
 
 
 def _retry_request(http, num_retries, req_type, sleep, rand, uri, method, *args,
@@ -82,21 +146,43 @@ def _retry_request(http, num_retries, req_type, sleep, rand, uri, method, *args,
     resp, content - Response from the http request (may be HTTP 5xx).
   """
   resp = None
+  content = None
   for retry_num in range(num_retries + 1):
     if retry_num > 0:
-      sleep(rand() * 2**retry_num)
-      logging.warning(
-          'Retry #%d for %s: %s %s%s' % (retry_num, req_type, method, uri,
-          ', following status: %d' % resp.status if resp else ''))
+      # Sleep before retrying.
+      sleep_time = rand() * 2 ** retry_num
+      LOGGER.warning(
+          'Sleeping %.2f seconds before retry %d of %d for %s: %s %s, after %s',
+          sleep_time, retry_num, num_retries, req_type, method, uri,
+          resp.status if resp else exception)
+      sleep(sleep_time)
 
     try:
+      exception = None
       resp, content = http.request(uri, method, *args, **kwargs)
-    except ssl.SSLError:
-      if retry_num == num_retries:
+    # Retry on SSL errors and socket timeout errors.
+    except _ssl_SSLError as ssl_error:
+      exception = ssl_error
+    except socket.timeout as socket_timeout:
+      # It's important that this be before socket.error as it's a subclass
+      # socket.timeout has no errorcode
+      exception = socket_timeout
+    except socket.error as socket_error:
+      # errno's contents differ by platform, so we have to match by name.
+      if socket.errno.errorcode.get(socket_error.errno) not in {
+        'WSAETIMEDOUT', 'ETIMEDOUT', 'EPIPE', 'ECONNABORTED'}:
         raise
+      exception = socket_error
+    except httplib2.ServerNotFoundError as server_not_found_error:
+      exception = server_not_found_error
+
+    if exception:
+      if retry_num == num_retries:
+        raise exception
       else:
         continue
-    if resp.status < 500:
+
+    if not _should_retry_response(resp.status, content):
       break
 
   return resp, content
@@ -123,7 +209,7 @@ class MediaUploadProgress(object):
       the percentage complete as a float, returning 0.0 if the total size of
       the upload is unknown.
     """
-    if self.total_size is not None:
+    if self.total_size is not None and self.total_size != 0:
       return float(self.resumable_progress) / float(self.total_size)
     else:
       return 0.0
@@ -149,7 +235,7 @@ class MediaDownloadProgress(object):
       the percentage complete as a float, returning 0.0 if the total size of
       the download is unknown.
     """
-    if self.total_size is not None:
+    if self.total_size is not None and self.total_size != 0:
       return float(self.resumable_progress) / float(self.total_size)
     else:
       return 0.0
@@ -429,7 +515,6 @@ class MediaFileUpload(MediaIoBaseUpload):
   Construct a MediaFileUpload and pass as the media_body parameter of the
   method. For example, if we had a service that allowed uploading images:
 
-
     media = MediaFileUpload('cow.png', mimetype='image/png',
       chunksize=1024*1024, resumable=True)
     farm.animals().insert(
@@ -562,29 +647,36 @@ class MediaIoBaseDownload(object):
     self._sleep = time.sleep
     self._rand = random.random
 
+    self._headers = {}
+    for k, v in six.iteritems(request.headers):
+      # allow users to supply custom headers by setting them on the request
+      # but strip out the ones that are set by default on requests generated by
+      # API methods like Drive's files().get(fileId=...)
+      if not k.lower() in ('accept', 'accept-encoding', 'user-agent'):
+        self._headers[k] = v
+
   @util.positional(1)
   def next_chunk(self, num_retries=0):
     """Get the next chunk of the download.
 
     Args:
-      num_retries: Integer, number of times to retry 500's with randomized
+      num_retries: Integer, number of times to retry with randomized
             exponential backoff. If all retries fail, the raised HttpError
             represents the last request. If zero (default), we attempt the
             request only once.
 
     Returns:
-      (status, done): (MediaDownloadStatus, boolean)
+      (status, done): (MediaDownloadProgress, boolean)
          The value of 'done' will be True when the media has been fully
-         downloaded.
+         downloaded or the total size of the media is unknown.
 
     Raises:
       googleapiclient.errors.HttpError if the response was not a 2xx.
       httplib2.HttpLib2Error if a transport error has occured.
     """
-    headers = {
-        'range': 'bytes=%d-%d' % (
+    headers = self._headers.copy()
+    headers['range'] = 'bytes=%d-%d' % (
             self._progress, self._progress + self._chunksize)
-        }
     http = self._request.http
 
     resp, content = _retry_request(
@@ -604,7 +696,7 @@ class MediaIoBaseDownload(object):
       elif 'content-length' in resp:
         self._total_size = int(resp['content-length'])
 
-      if self._progress == self._total_size:
+      if self._total_size is None or self._progress == self._total_size:
         self._done = True
       return MediaDownloadProgress(self._progress, self._total_size), self._done
     else:
@@ -686,10 +778,6 @@ class HttpRequest(object):
     self.response_callbacks = []
     self._in_error_state = False
 
-    # Pull the multipart boundary out of the content-type header.
-    major, minor, params = mimeparse.parse_mime_type(
-        self.headers.get('content-type', 'application/json'))
-
     # The size of the non-media part of the request.
     self.body_size = len(self.body or '')
 
@@ -710,7 +798,7 @@ class HttpRequest(object):
     Args:
       http: httplib2.Http, an http object to be used in place of the
             one the HttpRequest request object was constructed with.
-      num_retries: Integer, number of times to retry 500's with randomized
+      num_retries: Integer, number of times to retry with randomized
             exponential backoff. If all retries fail, the raised HttpError
             represents the last request. If zero (default), we attempt the
             request only once.
@@ -737,6 +825,7 @@ class HttpRequest(object):
     if 'content-length' not in self.headers:
       self.headers['content-length'] = str(self.body_size)
     # If the request URI is too long then turn it into a POST request.
+    # Assume that a GET request never contains a request body.
     if len(self.uri) > MAX_URI_LENGTH and self.method == 'GET':
       self.method = 'POST'
       self.headers['x-http-method-override'] = 'GET'
@@ -798,7 +887,7 @@ class HttpRequest(object):
     Args:
       http: httplib2.Http, an http object to be used in place of the
             one the HttpRequest request object was constructed with.
-      num_retries: Integer, number of times to retry 500's with randomized
+      num_retries: Integer, number of times to retry with randomized
             exponential backoff. If all retries fail, the raised HttpError
             represents the last request. If zero (default), we attempt the
             request only once.
@@ -882,7 +971,7 @@ class HttpRequest(object):
     for retry_num in range(num_retries + 1):
       if retry_num > 0:
         self._sleep(self._rand() * 2**retry_num)
-        logging.warning(
+        LOGGER.warning(
             'Retry #%d for media upload: %s %s, following status: %d'
             % (retry_num, self.method, self.uri, resp.status))
 
@@ -893,7 +982,7 @@ class HttpRequest(object):
       except:
         self._in_error_state = True
         raise
-      if resp.status < 500:
+      if not _should_retry_response(resp.status, content):
         break
 
     return self._process_response(resp, content)
@@ -918,7 +1007,11 @@ class HttpRequest(object):
     elif resp.status == 308:
       self._in_error_state = False
       # A "308 Resume Incomplete" indicates we are not done.
-      self.resumable_progress = int(resp['range'].split('-')[1]) + 1
+      try:
+        self.resumable_progress = int(resp['range'].split('-')[1]) + 1
+      except KeyError:
+        # If resp doesn't contain range header, resumable progress is 0
+        self.resumable_progress = 0
       if 'location' in resp:
         self.resumable_uri = resp['location']
     else:
@@ -1003,7 +1096,17 @@ class BatchHttpRequest(object):
       batch_uri: string, URI to send batch requests to.
     """
     if batch_uri is None:
-      batch_uri = 'https://www.googleapis.com/batch'
+      batch_uri = _LEGACY_BATCH_URI
+
+    if batch_uri == _LEGACY_BATCH_URI:
+      LOGGER.warn(
+        "You have constructed a BatchHttpRequest using the legacy batch "
+        "endpoint %s. This endpoint will be turned down on March 25, 2019. "
+        "Please provide the API-specific endpoint or use "
+        "service.new_batch_http_request(). For more details see "
+        "https://developers.googleblog.com/2018/03/discontinuing-support-for-json-rpc-and.html"
+        "and https://developers.google.com/api-client-library/python/guide/batch.",
+        _LEGACY_BATCH_URI)
     self._batch_uri = batch_uri
 
     # Global callback to be called for each individual response in the batch.
@@ -1041,21 +1144,25 @@ class BatchHttpRequest(object):
     # If there is no http per the request then refresh the http passed in
     # via execute()
     creds = None
-    if request.http is not None and hasattr(request.http.request,
-        'credentials'):
-      creds = request.http.request.credentials
-    elif http is not None and hasattr(http.request, 'credentials'):
-      creds = http.request.credentials
+    request_credentials = False
+
+    if request.http is not None:
+      creds = _auth.get_credentials_from_http(request.http)
+      request_credentials = True
+
+    if creds is None and http is not None:
+      creds = _auth.get_credentials_from_http(http)
+
     if creds is not None:
       if id(creds) not in self._refreshed_credentials:
-        creds.refresh(http)
+        _auth.refresh_credentials(creds)
         self._refreshed_credentials[id(creds)] = 1
 
     # Only apply the credentials if we are using the http object passed in,
     # otherwise apply() will get called during _serialize_request().
-    if request.http is None or not hasattr(request.http.request,
-        'credentials'):
-      creds.apply(request.headers)
+    if request.http is None or not request_credentials:
+      _auth.apply_credentials(creds, request.headers)
+
 
   def _id_to_header(self, id_):
     """Convert an id to a Content-ID header value.
@@ -1071,7 +1178,10 @@ class BatchHttpRequest(object):
     if self._base_id is None:
       self._base_id = uuid.uuid4()
 
-    return '<%s+%s>' % (self._base_id, quote(id_))
+    # NB: we intentionally leave whitespace between base/id and '+', so RFC2822
+    # line folding works properly on Python 3; see
+    # https://github.com/google/google-api-python-client/issues/164
+    return '<%s + %s>' % (self._base_id, quote(id_))
 
   def _header_to_id(self, header):
     """Convert a Content-ID header value to an id.
@@ -1092,7 +1202,7 @@ class BatchHttpRequest(object):
       raise BatchError("Invalid value for Content-ID: %s" % header)
     if '+' not in header:
       raise BatchError("Invalid value for Content-ID: %s" % header)
-    base, id_ = header[1:-1].rsplit('+', 1)
+    base, id_ = header[1:-1].split(' + ', 1)
 
     return unquote(id_)
 
@@ -1115,9 +1225,10 @@ class BatchHttpRequest(object):
     msg = MIMENonMultipart(major, minor)
     headers = request.headers.copy()
 
-    if request.http is not None and hasattr(request.http.request,
-        'credentials'):
-      request.http.request.credentials.apply(headers)
+    if request.http is not None:
+      credentials = _auth.get_credentials_from_http(request.http)
+      if credentials is not None:
+        _auth.apply_credentials(credentials, headers)
 
     # MIMENonMultipart adds its own Content-Type header.
     if 'content-type' in headers:
@@ -1191,7 +1302,7 @@ class BatchHttpRequest(object):
     from the server. The default behavior is to have the library generate it's
     own unique id. If the caller passes in a request_id then they must ensure
     uniqueness for each request_id, and if they are not an exception is
-    raised. Callers should either supply all request_ids or nevery supply a
+    raised. Callers should either supply all request_ids or never supply a
     request id, to avoid such an error.
 
     Args:
@@ -1201,8 +1312,8 @@ class BatchHttpRequest(object):
         request id, and the second is the deserialized response object. The
         third is an googleapiclient.errors.HttpError exception object if an HTTP error
         occurred while processing the request, or None if no errors occurred.
-      request_id: string, A unique id for the request. The id will be passed to
-        the callback with the response.
+      request_id: string, A unique id for the request. The id will be passed
+        to the callback with the response.
 
     Returns:
       None
@@ -1321,6 +1432,14 @@ class BatchHttpRequest(object):
 
     if http is None:
       raise ValueError("Missing a valid http object.")
+
+    # Special case for OAuth2Credentials-style objects which have not yet been
+    # refreshed with an initial access_token.
+    creds = _auth.get_credentials_from_http(http)
+    if creds is not None:
+      if not _auth.is_valid(creds):
+        LOGGER.info('Attempting refresh to obtain initial access_token')
+        _auth.refresh_credentials(creds)
 
     self._execute(http, self._order, self._requests)
 
@@ -1632,7 +1751,7 @@ def tunnel_patch(http):
       headers = {}
     if method == 'PATCH':
       if 'oauth_token' in headers.get('authorization', ''):
-        logging.warning(
+        LOGGER.warning(
             'OAuth 1.0 request made with Credentials after tunnel_patch.')
       headers['x-http-method-override'] = "PATCH"
       method = 'POST'
@@ -1642,3 +1761,21 @@ def tunnel_patch(http):
 
   http.request = new_request
   return http
+
+
+def build_http():
+  """Builds httplib2.Http object
+
+  Returns:
+  A httplib2.Http object, which is used to make http requests, and which has timeout set by default.
+  To override default timeout call
+
+    socket.setdefaulttimeout(timeout_in_sec)
+
+  before interacting with this method.
+  """
+  if socket.getdefaulttimeout() is not None:
+    http_timeout = socket.getdefaulttimeout()
+  else:
+    http_timeout = DEFAULT_HTTP_TIMEOUT_SEC
+  return httplib2.Http(timeout=http_timeout)

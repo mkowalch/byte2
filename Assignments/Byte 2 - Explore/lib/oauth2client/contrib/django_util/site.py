@@ -1,10 +1,10 @@
-# Copyright 2014 Google Inc. All Rights Reserved.
+# Copyright 2015 Google Inc.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#      http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "1.7.4"
+"""Contains Django URL patterns used for OAuth2 flow."""
 
-# Set default logging handler to avoid "No handler found" warnings.
-import logging
+from django.conf import urls
 
-try:  # Python 2.7+
-    from logging import NullHandler
-except ImportError:
-    class NullHandler(logging.Handler):
-        def emit(self, record):
-            pass
+from oauth2client.contrib.django_util import views
 
-logging.getLogger(__name__).addHandler(NullHandler())
+urlpatterns = [
+    urls.url(r'oauth2callback/', views.oauth2_callback, name="callback"),
+    urls.url(r'oauth2authorize/', views.oauth2_authorize, name="authorize")
+]
+
+urls = (urlpatterns, "google_oauth", "google_oauth")
