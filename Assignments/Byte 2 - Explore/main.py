@@ -33,11 +33,16 @@ service = build('fusiontables', 'v1', developerKey=API_KEY)
 
 # This is the table id for the fusion table
 #TABLE_ID = 'NxxxNXxXxxNxXXXXNXxXXXxXxxxNxXxNxXxxXxxX'
-TABLE_ID = '1t95igfZa0wehDiDy5Zn8McrFDbrdP5LArPQoeJag'
+# soccer table
+#TABLE_ID = '1t95igfZa0wehDiDy5Zn8McrFDbrdP5LArPQoeJag'
+# china.csv table
+TABLE_ID = '1dZ2yIKOTn0mr2W-rdcqMFGlGRvxX1Ns2wXE9TmQs'
+
 
 # This is the default columns for the query
 query_cols = []
-query_values = ['Forlan'] #Change to be the value(s) you're querying in the column you've specified
+#query_values = ['Forlan'] #Change to be the value(s) you're querying in the column you've specified
+query_values = ['2017'] #Change to be the value(s) you're querying in the column you've specified
 
 # Import the Flask Framework
 from flask import Flask, request
@@ -55,8 +60,35 @@ def get_all_data(query):
     logging.info(response['rows'])
     return response
 
-# make a query given a set of columns to retrieve
+
 def make_query(cols, values, limit):
+    string_cols = ""
+    if cols == []:
+        cols = ['*']
+    for col in cols:
+        if (' ' in col) == True:
+            string_cols = string_cols + ", '" + col + "'" #Columns that are more than one word need to be wrapped in single quotes
+        else:
+            string_cols = string_cols + ", " + col
+    string_cols = string_cols[2:len(string_cols)]
+
+    string_values = ""
+    for val in values:
+        string_values = string_values + ", " + val
+    string_values = string_values[2:len(string_values)]
+    
+    #Change this query to have your corresponding column (in our soccer example, the column for our WHERE is Scorer).
+    query = "SELECT " + string_cols + " FROM " + TABLE_ID + " WHERE year = '" + string_values + "'"
+
+    query = query + " LIMIT " + str(limit)
+
+    logging.info(query)
+    # query = "SELECT * FROM " + TABLE_ID + " WHERE  Scorer = 'Forlan' LIMIT 5"
+
+    return query
+ 
+# make a query given a set of columns to retrieve
+def make_query_OLD(cols, values, limit):
     string_cols = ""
     if cols == []:
         cols = ['*']

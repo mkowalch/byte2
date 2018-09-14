@@ -46,27 +46,23 @@
       <!-- Main jumbotron for a primary marketing message or call to action -->
       <div class="jumbotron">
 	<h1>Quality: About This Data Set</h1>
-        <p>Write a brief summary about the quality of the data set here</a></p>
+        <p>The dataset contains a mix of fairly "clean" (easy to use as input for a computer program) columns as well as columns with random junk and what appears to be scratch paper areas.  If you eliminate those junk columns the columns with the real data are easy to work with.  There are several header rows with formatting that needed to be changed to make it more database friendly, but that was easy to do by hand.  I also added some columns where I broke out the Month, Day, and Year to make it easy to query with sql.  I used python for this last step.</a></p>
       </div>
 
     
       <div class="page-header">
 	<h2>Is the data complete?</h2>
-	<p>If not, what is missing and what concerns does it raise?
-	What is your evidence for this?</p>
+	<p>I think this data is fine as it is.  If I were to continue with this analysis I would get the populations of each country listed and see how they match up when we divide the amount imported by population.  China is much bigger than all of the other countries so it imports the most, but how much is being imported per person?
       </div>
       
       <div class="page-header">
 	<h2>Is the data coherent?</h2>
-	<p>Does it make sense relative to itself? Does it match your
-	expectations? Are the distributions sensible? What is your
-	evidence for this?</p>
+	<p>I am not sure about this one without doing more analysis.  However, looking at the data across multiple years (not shown in the app) I see the same kind of fluctuation in purchases by China so compared to other years, 2017 does not seem to stand out.  I was surprised that China and Japan would import soybeans.  I assumed since they both have a long history of consuming soybeans that their agriculture sectors would include them almost as a matter of national pride.  However, China is the number one importer and Japan is the number four importer of U.S. soybeans.</p>
       </div>
 
       <div class="page-header">
 	<h2>Is the data correct?</h2>
-	<p>What aspects of this data can you verify? How did you do so? What did
-	you find?</p>
+	<p>For verification, I found a news article mentioning a decline in exports to China, which is seen in the data.  The article can be found here: https://www.cnbc.com/2018/06/05/soybean-exports-to-china-are-down-big-from-last-year-with-lost-sales-mounting.html.  However, I do not show this on my table, since I picked 2017 where the article talks about 2018.  If I had some more time to rearrange the data I could make a comparison over time of the pct_change column. News articles are hardly verification, but as soon as I started reading the article I suspected that they were using this dataset or something coming from the same source.</p>
       </div>
 
     </div> <!-- /container -->
